@@ -1,0 +1,1190 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Voxel Village Isometric Simulation</title>
+  <style>
+    :root {
+      color-scheme: only light;
+    }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #bfe7ff;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    #app {
+      position: relative;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: linear-gradient(180deg, #ccecff 0%, #daf3ff 48%, #f1fbff 100%);
+    }
+    canvas {
+      width: 100%;
+      height: 100%;
+      display: block;
+      image-rendering: auto;
+      cursor: grab;
+    }
+    canvas.dragging {
+      cursor: grabbing;
+    }
+    .hud {
+      position: absolute;
+      top: 16px;
+      left: 16px;
+      max-width: min(420px, calc(100vw - 32px));
+      padding: 14px 16px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.78);
+      box-shadow: 0 12px 36px rgba(35, 65, 88, 0.18);
+      backdrop-filter: blur(14px);
+      color: #1d3140;
+      user-select: none;
+      pointer-events: none;
+    }
+    .hud h1 {
+      margin: 0 0 6px;
+      font-size: 20px;
+      line-height: 1.15;
+      letter-spacing: -0.02em;
+    }
+    .hud p {
+      margin: 0;
+      font-size: 13px;
+      line-height: 1.45;
+      opacity: 0.9;
+    }
+    .footer {
+      position: absolute;
+      right: 16px;
+      bottom: 16px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      background: rgba(255,255,255,0.7);
+      box-shadow: 0 10px 30px rgba(35,65,88,0.14);
+      color: #294155;
+      font-size: 12px;
+      user-select: none;
+      pointer-events: none;
+    }
+  </style>
+</head>
+<body>
+  <div id="app">
+    <canvas id="scene"></canvas>
+    <div class="hud">
+      <h1>Voxel Village</h1>
+      <p>Drag to orbit • Shift-drag / right-drag to pan • Mouse wheel to zoom • WASD to pan • Q/E to rotate • R/F to tilt • +/- to zoom • Space to pause villagers</p>
+    </div>
+    <div class="footer">Isometric voxel simulation</div>
+  </div>
+
+  <script>
+    const canvas = document.getElementById('scene')
+    const ctx = canvas.getContext('2d')
+    let viewportWidth = 0
+    let viewportHeight = 0
+
+    const TAU = Math.PI * 2
+    const clamp = (v, min, max) => Math.min(max, Math.max(min, v))
+    const lerp = (a, b, t) => a + (b - a) * t
+    const smoothstep = (edge0, edge1, x) => {
+      const t = clamp((x - edge0) / (edge1 - edge0), 0, 1)
+      return t * t * (3 - 2 * t)
+    }
+    const vec3 = (x = 0, y = 0, z = 0) => ({ x, y, z })
+    const add = (a, b) => ({ x: a.x + b.x, y: a.y + b.y, z: a.z + b.z })
+    const sub = (a, b) => ({ x: a.x - b.x, y: a.y - b.y, z: a.z - b.z })
+    const scale = (a, s) => ({ x: a.x * s, y: a.y * s, z: a.z * s })
+    const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z
+    const cross = (a, b) => ({
+      x: a.y * b.z - a.z * b.y,
+      y: a.z * b.x - a.x * b.z,
+      z: a.x * b.y - a.y * b.x,
+    })
+    const length = (v) => Math.hypot(v.x, v.y, v.z)
+    const normalize = (v) => {
+      const len = length(v) || 1
+      return { x: v.x / len, y: v.y / len, z: v.z / len }
+    }
+    const rotateY = (v, yaw) => {
+      const c = Math.cos(yaw)
+      const s = Math.sin(yaw)
+      return {
+        x: v.x * c - v.z * s,
+        y: v.y,
+        z: v.x * s + v.z * c,
+      }
+    }
+    const gaussian = (x, z, cx, cz, height, spread) => {
+      const dx = x - cx
+      const dz = z - cz
+      return height * Math.exp(-(dx * dx + dz * dz) / spread)
+    }
+    const hash2 = (x, y) => {
+      const n = Math.sin(x * 127.1 + y * 311.7) * 43758.5453123
+      return n - Math.floor(n)
+    }
+
+    const parseHex = (hex) => {
+      const c = hex.replace('#', '')
+      const value = c.length === 3
+        ? c.split('').map((ch) => ch + ch).join('')
+        : c
+      const num = parseInt(value, 16)
+      return {
+        r: (num >> 16) & 255,
+        g: (num >> 8) & 255,
+        b: num & 255,
+      }
+    }
+    const mixRGB = (a, b, t) => ({
+      r: Math.round(lerp(a.r, b.r, t)),
+      g: Math.round(lerp(a.g, b.g, t)),
+      b: Math.round(lerp(a.b, b.b, t)),
+    })
+    const shadeHex = (hex, light = 1, fog = 0, alpha = 1) => {
+      const c = parseHex(hex)
+      const lit = {
+        r: clamp(Math.round(c.r * light), 0, 255),
+        g: clamp(Math.round(c.g * light), 0, 255),
+        b: clamp(Math.round(c.b * light), 0, 255),
+      }
+      const fogged = mixRGB(lit, { r: 206, g: 231, b: 247 }, fog)
+      return `rgba(${fogged.r}, ${fogged.g}, ${fogged.b}, ${alpha})`
+    }
+
+    const palette = {
+      grass: '#7fbc5b',
+      grass2: '#68a84d',
+      cliff: '#8c7a58',
+      dirt: '#8f6a44',
+      path: '#c7b394',
+      stone: '#c4c9cf',
+      stoneDark: '#8d98a4',
+      wood: '#8d613a',
+      woodDark: '#604126',
+      roofRed: '#c35a50',
+      roofBlue: '#5b7da4',
+      roofOchre: '#c7904d',
+      plaster: '#f1e4d2',
+      brick: '#d7b38c',
+      water: '#69b7d5',
+      waterDark: '#4599b6',
+      leaves: '#5f9a4c',
+      leaves2: '#497d39',
+      pine: '#3f6d37',
+      crop: '#c8c050',
+      crop2: '#7cbe4f',
+      flowerPink: '#f098b2',
+      flowerBlue: '#79bdf0',
+      fence: '#b48b5c',
+      smoke: '#bcc8d4',
+      stallCloth1: '#d95b5b',
+      stallCloth2: '#f3d99d',
+      stallCloth3: '#5a93cd',
+      lantern: '#ffd36b',
+    }
+
+    const WORLD = {
+      size: 36,
+      half: 18,
+      waterLevel: 0.35,
+    }
+
+    const heights = Array.from({ length: WORLD.size }, () => Array(WORLD.size).fill(0))
+    const water = Array.from({ length: WORLD.size }, () => Array(WORLD.size).fill(false))
+    const road = Array.from({ length: WORLD.size }, () => Array(WORLD.size).fill(false))
+    const occupied = Array.from({ length: WORLD.size }, () => Array(WORLD.size).fill(false))
+    const bridgeMap = Array.from({ length: WORLD.size }, () => Array(WORLD.size).fill(false))
+    const flowerMap = Array.from({ length: WORLD.size }, () => Array(WORLD.size).fill(null))
+
+    const staticFaces = []
+    const waterTiles = []
+    const smokeEmitters = []
+    const villagers = []
+    const lanterns = []
+    const clouds = []
+
+    const toWorldX = (gx) => gx - WORLD.half
+    const toWorldZ = (gz) => gz - WORLD.half
+    const cellCenter = (gx, gz, yOffset = 0.03) => ({
+      x: toWorldX(gx) + 0.5,
+      y: getSurfaceY(gx, gz) + yOffset,
+      z: toWorldZ(gz) + 0.5,
+    })
+
+    function computeNormal(verts) {
+      const e1 = sub(verts[1], verts[0])
+      const e2 = sub(verts[2], verts[0])
+      return normalize(cross(e1, e2))
+    }
+
+    function pushFace(target, verts, color, options = {}) {
+      target.push({
+        verts,
+        color,
+        alpha: options.alpha ?? 1,
+        emissive: options.emissive ?? 0,
+        strokeAlpha: options.strokeAlpha ?? 0.16,
+        normal: options.normal || computeNormal(verts),
+      })
+    }
+
+    function pushQuad(target, a, b, c, d, color, options = {}) {
+      pushFace(target, [a, b, c, d], color, options)
+    }
+
+    function pushBox(target, x, y, z, w, h, d, color, options = {}) {
+      const yaw = options.yaw || 0
+      const pivot = options.pivot || { x: x + w / 2, y, z: z + d / 2 }
+      const verts = [
+        vec3(-w / 2, 0, -d / 2),
+        vec3(w / 2, 0, -d / 2),
+        vec3(w / 2, 0, d / 2),
+        vec3(-w / 2, 0, d / 2),
+        vec3(-w / 2, h, -d / 2),
+        vec3(w / 2, h, -d / 2),
+        vec3(w / 2, h, d / 2),
+        vec3(-w / 2, h, d / 2),
+      ].map((v) => {
+        const rotated = yaw ? rotateY(v, yaw) : v
+        return vec3(rotated.x + pivot.x, rotated.y + pivot.y, rotated.z + pivot.z)
+      })
+
+      pushQuad(target, verts[7], verts[6], verts[5], verts[4], color, options)
+      pushQuad(target, verts[4], verts[5], verts[1], verts[0], color, options)
+      pushQuad(target, verts[6], verts[2], verts[1], verts[5], color, options)
+      pushQuad(target, verts[7], verts[3], verts[2], verts[6], color, options)
+      pushQuad(target, verts[7], verts[4], verts[0], verts[3], color, options)
+      if (options.bottom) {
+        pushQuad(target, verts[0], verts[1], verts[2], verts[3], color, options)
+      }
+    }
+
+    function pushTopPrism(target, x, y, z, w, d, h, color, sideColor = palette.cliff) {
+      const a = vec3(x, y + h, z)
+      const b = vec3(x + w, y + h, z)
+      const c = vec3(x + w, y + h, z + d)
+      const d0 = vec3(x, y + h, z + d)
+      pushQuad(target, d0, c, b, a, color)
+      const faces = [
+        [vec3(x, y + h, z), vec3(x + w, y + h, z), vec3(x + w, y, z), vec3(x, y, z)],
+        [vec3(x + w, y + h, z + d), vec3(x + w, y + h, z), vec3(x + w, y, z), vec3(x + w, y, z + d)],
+        [vec3(x, y + h, z + d), vec3(x + w, y + h, z + d), vec3(x + w, y, z + d), vec3(x, y, z + d)],
+        [vec3(x, y + h, z), vec3(x, y + h, z + d), vec3(x, y, z + d), vec3(x, y, z)],
+      ]
+      for (const f of faces) pushFace(target, f, sideColor)
+    }
+
+    function addTerrainFace(gx, gz) {
+      const h = heights[gx][gz]
+      const x = toWorldX(gx)
+      const z = toWorldZ(gz)
+      const topColor = water[gx][gz]
+        ? palette.dirt
+        : ((gx + gz) % 3 === 0 ? palette.grass2 : palette.grass)
+
+      pushQuad(
+        staticFaces,
+        vec3(x, h, z + 1),
+        vec3(x + 1, h, z + 1),
+        vec3(x + 1, h, z),
+        vec3(x, h, z),
+        topColor,
+      )
+
+      const neighbors = [
+        { nx: gx, nz: gz - 1, verts: (nh) => [vec3(x, h, z), vec3(x + 1, h, z), vec3(x + 1, nh, z), vec3(x, nh, z)] },
+        { nx: gx + 1, nz: gz, verts: (nh) => [vec3(x + 1, h, z + 1), vec3(x + 1, h, z), vec3(x + 1, nh, z), vec3(x + 1, nh, z + 1)] },
+        { nx: gx, nz: gz + 1, verts: (nh) => [vec3(x, h, z + 1), vec3(x + 1, h, z + 1), vec3(x + 1, nh, z + 1), vec3(x, nh, z + 1)] },
+        { nx: gx - 1, nz: gz, verts: (nh) => [vec3(x, h, z), vec3(x, h, z + 1), vec3(x, nh, z + 1), vec3(x, nh, z)] },
+      ]
+      for (const side of neighbors) {
+        const inside = side.nx >= 0 && side.nz >= 0 && side.nx < WORLD.size && side.nz < WORLD.size
+        const nh = inside ? heights[side.nx][side.nz] : 0
+        if (nh < h) {
+          pushFace(staticFaces, side.verts(nh), palette.cliff)
+        }
+      }
+    }
+
+    function addRoadTile(gx, gz, color = palette.path) {
+      const y = getSurfaceY(gx, gz) + 0.03
+      const x = toWorldX(gx)
+      const z = toWorldZ(gz)
+      pushQuad(
+        staticFaces,
+        vec3(x, y, z + 1),
+        vec3(x + 1, y, z + 1),
+        vec3(x + 1, y, z),
+        vec3(x, y, z),
+        color,
+        { strokeAlpha: 0.08 },
+      )
+    }
+
+    function addFlowerPatch(gx, gz, variant) {
+      const y = getSurfaceY(gx, gz) + 0.04
+      const x = toWorldX(gx)
+      const z = toWorldZ(gz)
+      const color = variant === 'blue' ? palette.flowerBlue : palette.flowerPink
+      for (let i = 0; i < 4; i++) {
+        const ox = 0.15 + hash2(gx * 7 + i, gz * 11) * 0.7
+        const oz = 0.15 + hash2(gx * 9, gz * 5 + i) * 0.7
+        pushBox(staticFaces, x + ox, y, z + oz, 0.08, 0.18, 0.08, color)
+      }
+    }
+
+    function addStone(gx, gz) {
+      const y = getSurfaceY(gx, gz)
+      const x = toWorldX(gx) + 0.18 + hash2(gx, gz) * 0.2
+      const z = toWorldZ(gz) + 0.2 + hash2(gz, gx) * 0.2
+      pushBox(staticFaces, x, y + 0.02, z, 0.45, 0.24, 0.35, palette.stoneDark)
+      pushBox(staticFaces, x + 0.18, y + 0.08, z + 0.08, 0.24, 0.18, 0.2, palette.stone)
+    }
+
+    function addTree(gx, gz, pine = false) {
+      occupied[gx][gz] = true
+      const baseY = getSurfaceY(gx, gz)
+      const wx = toWorldX(gx) + 0.5
+      const wz = toWorldZ(gz) + 0.5
+      const jitterX = (hash2(gx, gz) - 0.5) * 0.18
+      const jitterZ = (hash2(gz, gx) - 0.5) * 0.18
+      const trunkH = pine ? 1.0 : 0.8 + hash2(gx + 9, gz + 2) * 0.45
+      const trunkW = pine ? 0.22 : 0.28
+      pushBox(staticFaces, wx - trunkW / 2 + jitterX, baseY + 0.02, wz - trunkW / 2 + jitterZ, trunkW, trunkH, trunkW, palette.woodDark)
+
+      if (pine) {
+        pushBox(staticFaces, wx - 0.62 + jitterX, baseY + 0.55, wz - 0.62 + jitterZ, 1.24, 0.7, 1.24, palette.pine)
+        pushBox(staticFaces, wx - 0.46 + jitterX, baseY + 1.05, wz - 0.46 + jitterZ, 0.92, 0.58, 0.92, palette.leaves2)
+        pushBox(staticFaces, wx - 0.28 + jitterX, baseY + 1.45, wz - 0.28 + jitterZ, 0.56, 0.42, 0.56, palette.pine)
+      } else {
+        pushBox(staticFaces, wx - 0.72 + jitterX, baseY + trunkH - 0.05, wz - 0.72 + jitterZ, 1.44, 0.82, 1.44, palette.leaves)
+        pushBox(staticFaces, wx - 0.5 + jitterX, baseY + trunkH + 0.58, wz - 0.5 + jitterZ, 1.0, 0.58, 1.0, palette.leaves2)
+        if (hash2(gx * 2, gz * 3) > 0.42) {
+          pushBox(staticFaces, wx - 0.34 + jitterX, baseY + trunkH + 1.0, wz - 0.34 + jitterZ, 0.68, 0.34, 0.68, palette.leaves)
+        }
+      }
+    }
+
+    function addFenceLine(gx0, gz0, gx1, gz1) {
+      const dx = Math.sign(gx1 - gx0)
+      const dz = Math.sign(gz1 - gz0)
+      const steps = Math.max(Math.abs(gx1 - gx0), Math.abs(gz1 - gz0))
+      for (let i = 0; i <= steps; i++) {
+        const gx = gx0 + dx * i
+        const gz = gz0 + dz * i
+        const y = getSurfaceY(gx, gz)
+        const x = toWorldX(gx) + 0.45
+        const z = toWorldZ(gz) + 0.45
+        pushBox(staticFaces, x - 0.05, y + 0.02, z - 0.05, 0.1, 0.5, 0.1, palette.fence)
+        if (dx !== 0) {
+          pushBox(staticFaces, x - 0.05, y + 0.18, z - 0.48, 0.1, 0.08, 0.96, palette.fence)
+          pushBox(staticFaces, x - 0.05, y + 0.34, z - 0.48, 0.1, 0.08, 0.96, palette.fence)
+        } else {
+          pushBox(staticFaces, x - 0.48, y + 0.18, z - 0.05, 0.96, 0.08, 0.1, palette.fence)
+          pushBox(staticFaces, x - 0.48, y + 0.34, z - 0.05, 0.96, 0.08, 0.1, palette.fence)
+        }
+      }
+    }
+
+    function addCrops(x0, z0, w, d) {
+      for (let gx = x0; gx < x0 + w; gx++) {
+        for (let gz = z0; gz < z0 + d; gz++) {
+          const y = getSurfaceY(gx, gz)
+          const x = toWorldX(gx)
+          const z = toWorldZ(gz)
+          pushBox(staticFaces, x + 0.02, y + 0.02, z + 0.02, 0.96, 0.14, 0.96, palette.dirt)
+          const stripes = 4
+          for (let i = 0; i < stripes; i++) {
+            const offset = i / stripes
+            const cropColor = (i + gx + gz) % 2 === 0 ? palette.crop : palette.crop2
+            pushBox(staticFaces, x + 0.08, y + 0.16, z + 0.1 + offset * 0.18, 0.84, 0.22, 0.06, cropColor)
+          }
+        }
+      }
+    }
+
+    function addLantern(gx, gz) {
+      const y = getSurfaceY(gx, gz)
+      const x = toWorldX(gx) + 0.5
+      const z = toWorldZ(gz) + 0.5
+      pushBox(staticFaces, x - 0.06, y + 0.02, z - 0.06, 0.12, 0.82, 0.12, palette.woodDark)
+      pushBox(staticFaces, x - 0.15, y + 0.72, z - 0.15, 0.3, 0.18, 0.3, palette.lantern, { emissive: 0.28 })
+      lanterns.push({ x, y: y + 0.82, z })
+    }
+
+    function addBridge() {
+      for (let gx = 5; gx <= 9; gx++) {
+        for (let gz = 16; gz <= 17; gz++) {
+          bridgeMap[gx][gz] = true
+          const x = toWorldX(gx)
+          const z = toWorldZ(gz)
+          pushBox(staticFaces, x + 0.02, 1.02, z + 0.05, 0.96, 0.16, 0.9, palette.wood)
+          if (gz === 16 || gz === 17) {
+            pushBox(staticFaces, x + 0.05, 1.18, z + 0.05, 0.08, 0.35, 0.08, palette.woodDark)
+            pushBox(staticFaces, x + 0.87, 1.18, z + 0.05, 0.08, 0.35, 0.08, palette.woodDark)
+          }
+        }
+      }
+      pushBox(staticFaces, toWorldX(5) + 0.02, 1.32, toWorldZ(16) + 0.08, 4.96, 0.08, 0.08, palette.woodDark)
+      pushBox(staticFaces, toWorldX(5) + 0.02, 1.32, toWorldZ(17) + 0.84, 4.96, 0.08, 0.08, palette.woodDark)
+    }
+
+    function addMarketStall(gx, gz, clothColor) {
+      const baseY = getSurfaceY(gx, gz)
+      const x = toWorldX(gx) + 0.5
+      const z = toWorldZ(gz) + 0.5
+      pushBox(staticFaces, x - 0.65, baseY + 0.02, z - 0.45, 1.3, 0.18, 0.9, palette.wood)
+      pushBox(staticFaces, x - 0.62, baseY + 0.2, z - 0.42, 0.08, 0.88, 0.08, palette.woodDark)
+      pushBox(staticFaces, x + 0.54, baseY + 0.2, z - 0.42, 0.08, 0.88, 0.08, palette.woodDark)
+      pushBox(staticFaces, x - 0.62, baseY + 0.2, z + 0.34, 0.08, 0.88, 0.08, palette.woodDark)
+      pushBox(staticFaces, x + 0.54, baseY + 0.2, z + 0.34, 0.08, 0.88, 0.08, palette.woodDark)
+      pushBox(staticFaces, x - 0.72, baseY + 1.0, z - 0.52, 1.44, 0.18, 1.04, clothColor)
+      pushBox(staticFaces, x - 0.72, baseY + 1.18, z - 0.52, 1.44, 0.1, 0.18, palette.stallCloth2)
+    }
+
+    function addFountain(gx, gz) {
+      const y = getSurfaceY(gx, gz)
+      const x = toWorldX(gx)
+      const z = toWorldZ(gz)
+      pushTopPrism(staticFaces, x + 0.1, y, z + 0.1, 1.8, 1.8, 0.3, palette.stone, palette.stoneDark)
+      pushTopPrism(staticFaces, x + 0.35, y + 0.3, z + 0.35, 1.3, 1.3, 0.22, palette.water, palette.stoneDark)
+      pushBox(staticFaces, x + 0.82, y + 0.3, z + 0.82, 0.36, 0.76, 0.36, palette.stoneDark)
+      pushBox(staticFaces, x + 0.76, y + 1.06, z + 0.76, 0.48, 0.16, 0.48, palette.stone)
+    }
+
+    function addBench(gx, gz, horizontal = true) {
+      const y = getSurfaceY(gx, gz)
+      const x = toWorldX(gx) + 0.5
+      const z = toWorldZ(gz) + 0.5
+      if (horizontal) {
+        pushBox(staticFaces, x - 0.48, y + 0.22, z - 0.14, 0.96, 0.12, 0.28, palette.wood)
+        pushBox(staticFaces, x - 0.44, y + 0.02, z - 0.12, 0.12, 0.22, 0.12, palette.woodDark)
+        pushBox(staticFaces, x + 0.32, y + 0.02, z - 0.12, 0.12, 0.22, 0.12, palette.woodDark)
+      } else {
+        pushBox(staticFaces, x - 0.14, y + 0.22, z - 0.48, 0.28, 0.12, 0.96, palette.wood)
+        pushBox(staticFaces, x - 0.12, y + 0.02, z - 0.44, 0.12, 0.22, 0.12, palette.woodDark)
+        pushBox(staticFaces, x - 0.12, y + 0.02, z + 0.32, 0.12, 0.22, 0.12, palette.woodDark)
+      }
+    }
+
+    function addHouse(gx, gz, w, d, options = {}) {
+      const x = toWorldX(gx)
+      const z = toWorldZ(gz)
+      const baseY = getSurfaceY(gx, gz)
+      const wallH = options.wallH || 1.7
+      const roofH = options.roofH || 1.2
+      const wallColor = options.wallColor || palette.plaster
+      const roofColor = options.roofColor || palette.roofRed
+      const trimColor = options.trimColor || palette.woodDark
+      const chimney = options.chimney !== false
+      const doorSide = options.doorSide || 'south'
+
+      for (let ix = 0; ix < w; ix++) {
+        for (let iz = 0; iz < d; iz++) occupied[gx + ix][gz + iz] = true
+      }
+
+      pushBox(staticFaces, x + 0.08, baseY + 0.02, z + 0.08, w - 0.16, wallH, d - 0.16, wallColor)
+
+      const roofInsetSteps = Math.max(2, Math.min(w, d))
+      for (let i = 0; i < roofInsetSteps; i++) {
+        const inset = 0.04 + i * 0.14
+        const layerW = w - inset * 2
+        const layerD = d - inset * 2
+        if (layerW <= 0.4 || layerD <= 0.4) break
+        pushBox(staticFaces, x + inset, baseY + wallH + i * (roofH / roofInsetSteps), z + inset, layerW, roofH / roofInsetSteps + 0.02, layerD, roofColor)
+      }
+
+      if (doorSide === 'south') {
+        pushBox(staticFaces, x + w * 0.42, baseY + 0.02, z + d - 0.06, 0.54, 1.05, 0.12, trimColor)
+      } else if (doorSide === 'north') {
+        pushBox(staticFaces, x + w * 0.42, baseY + 0.02, z - 0.06, 0.54, 1.05, 0.12, trimColor)
+      } else if (doorSide === 'west') {
+        pushBox(staticFaces, x - 0.06, baseY + 0.02, z + d * 0.42, 0.12, 1.05, 0.54, trimColor)
+      } else {
+        pushBox(staticFaces, x + w - 0.06, baseY + 0.02, z + d * 0.42, 0.12, 1.05, 0.54, trimColor)
+      }
+
+      const windowColor = '#98c6ea'
+      if (w >= 3) {
+        pushBox(staticFaces, x + 0.34, baseY + 0.7, z - 0.02, 0.52, 0.45, 0.08, windowColor)
+        pushBox(staticFaces, x + w - 0.86, baseY + 0.7, z - 0.02, 0.52, 0.45, 0.08, windowColor)
+      }
+      if (d >= 3) {
+        pushBox(staticFaces, x - 0.02, baseY + 0.7, z + 0.5, 0.08, 0.45, 0.52, windowColor)
+        pushBox(staticFaces, x + w - 0.06, baseY + 0.7, z + d - 1.02, 0.08, 0.45, 0.52, windowColor)
+      }
+
+      if (chimney) {
+        const chX = x + w - 0.76
+        const chZ = z + 0.5
+        pushBox(staticFaces, chX, baseY + wallH + roofH * 0.45, chZ, 0.35, 0.9, 0.35, palette.stoneDark)
+        smokeEmitters.push({ x: chX + 0.18, y: baseY + wallH + roofH * 0.45 + 0.9, z: chZ + 0.18, phase: hash2(gx, gz) * TAU })
+      }
+    }
+
+    function generateHeights() {
+      for (let gx = 0; gx < WORLD.size; gx++) {
+        for (let gz = 0; gz < WORLD.size; gz++) {
+          const dx = gx - WORLD.half + 0.5
+          const dz = gz - WORLD.half + 0.5
+          const dist = Math.hypot(dx, dz)
+          let h = 1.1
+            + 0.26 * Math.sin(gx * 0.42)
+            + 0.24 * Math.cos(gz * 0.37)
+            + 0.18 * Math.sin((gx + gz) * 0.22)
+          h += smoothstep(5, 17, dist) * 1.9
+          h += gaussian(dx, dz, -10, -11, 1.1, 18)
+          h += gaussian(dx, dz, 11, -9, 1.0, 16)
+          h += gaussian(dx, dz, -7, 11, 1.2, 14)
+          h += gaussian(dx, dz, 10, 10, 1.1, 16)
+
+          if (gx >= 11 && gx <= 27 && gz >= 8 && gz <= 27) h = Math.min(h, 1.4)
+          if (gx >= 13 && gx <= 24 && gz >= 10 && gz <= 24) h = Math.min(h, 1.0)
+          if (gx >= 24 && gx <= 31 && gz >= 8 && gz <= 15) h = Math.min(h, 1.0)
+
+          const riverX = 7.4 + Math.sin(gz * 0.27) * 1.1 + Math.sin(gz * 0.08 + 1.2) * 0.7
+          const deltaRiver = Math.abs(gx - riverX)
+          if (gz > 2 && gz < 32 && deltaRiver < 1.2) {
+            h = 0
+            water[gx][gz] = true
+          } else if (gz > 2 && gz < 32 && deltaRiver < 1.7) {
+            h = Math.min(h, 1)
+          }
+
+          heights[gx][gz] = clamp(Math.round(h), 0, 5)
+        }
+      }
+    }
+
+    function markRoads() {
+      const fillRoadRect = (x0, z0, x1, z1) => {
+        for (let gx = x0; gx <= x1; gx++) {
+          for (let gz = z0; gz <= z1; gz++) road[gx][gz] = true
+        }
+      }
+      fillRoadRect(16, 15, 20, 19)
+      fillRoadRect(5, 16, 31, 17)
+      fillRoadRect(18, 9, 19, 28)
+      fillRoadRect(14, 12, 17, 13)
+      fillRoadRect(20, 12, 23, 13)
+      fillRoadRect(12, 22, 18, 23)
+      fillRoadRect(20, 22, 26, 23)
+      fillRoadRect(24, 10, 29, 11)
+      fillRoadRect(14, 20, 15, 22)
+      fillRoadRect(25, 18, 27, 20)
+      fillRoadRect(8, 16, 10, 17)
+    }
+
+    function scatterDecorationMaps() {
+      for (let gx = 1; gx < WORLD.size - 1; gx++) {
+        for (let gz = 1; gz < WORLD.size - 1; gz++) {
+          if (road[gx][gz] || water[gx][gz]) continue
+          const h = heights[gx][gz]
+          const nearVillage = gx > 9 && gx < 29 && gz > 7 && gz < 28
+          const noise = hash2(gx * 3, gz * 7)
+          if (!nearVillage && h >= 2 && noise > 0.92) {
+            flowerMap[gx][gz] = noise > 0.96 ? 'blue' : 'pink'
+          } else if (nearVillage && h <= 1 && noise > 0.975) {
+            flowerMap[gx][gz] = noise > 0.987 ? 'blue' : 'pink'
+          }
+        }
+      }
+    }
+
+    function getSurfaceY(gx, gz) {
+      if (gx < 0 || gz < 0 || gx >= WORLD.size || gz >= WORLD.size) return 0
+      if (bridgeMap[gx][gz]) return 1.18
+      if (water[gx][gz]) return WORLD.waterLevel
+      return heights[gx][gz]
+    }
+
+    function buildWorld() {
+      generateHeights()
+      markRoads()
+      scatterDecorationMaps()
+
+      for (let gx = 0; gx < WORLD.size; gx++) {
+        for (let gz = 0; gz < WORLD.size; gz++) addTerrainFace(gx, gz)
+      }
+
+      for (let gx = 0; gx < WORLD.size; gx++) {
+        for (let gz = 0; gz < WORLD.size; gz++) {
+          if (water[gx][gz]) {
+            waterTiles.push({ gx, gz, phase: hash2(gx, gz) * TAU })
+          }
+        }
+      }
+
+      addBridge()
+
+      for (let gx = 0; gx < WORLD.size; gx++) {
+        for (let gz = 0; gz < WORLD.size; gz++) {
+          if (road[gx][gz] && !bridgeMap[gx][gz] && !water[gx][gz]) addRoadTile(gx, gz)
+        }
+      }
+
+      addHouse(13, 11, 3, 3, { roofColor: palette.roofBlue, wallColor: palette.plaster, doorSide: 'south' })
+      addHouse(20, 11, 4, 3, { roofColor: palette.roofOchre, wallColor: palette.brick, doorSide: 'south' })
+      addHouse(23, 16, 3, 3, { roofColor: palette.roofRed, wallColor: palette.plaster, doorSide: 'west' })
+      addHouse(12, 20, 4, 3, { roofColor: palette.roofRed, wallColor: palette.brick, doorSide: 'east' })
+      addHouse(19, 21, 3, 3, { roofColor: palette.roofBlue, wallColor: palette.plaster, doorSide: 'north' })
+      addHouse(24, 20, 5, 4, { roofColor: palette.roofOchre, wallColor: palette.plaster, wallH: 2.0, roofH: 1.25, doorSide: 'west' })
+      addHouse(26, 8, 4, 3, { roofColor: palette.roofRed, wallColor: palette.brick, chimney: false, doorSide: 'south' })
+
+      addMarketStall(17, 14, palette.stallCloth1)
+      addMarketStall(19, 14, palette.stallCloth3)
+      addMarketStall(16, 20, palette.stallCloth2)
+      addFountain(18, 17)
+      addBench(17, 18, true)
+      addBench(20, 18, true)
+      addBench(18, 20, false)
+      addBench(18, 14, false)
+
+      addCrops(25, 12, 6, 3)
+      addFenceLine(24, 12, 31, 12)
+      addFenceLine(24, 15, 31, 15)
+      addFenceLine(24, 12, 24, 15)
+      addFenceLine(31, 12, 31, 15)
+
+      addLantern(16, 16)
+      addLantern(20, 16)
+      addLantern(18, 14)
+      addLantern(18, 20)
+      addLantern(10, 16)
+      addLantern(27, 17)
+
+      for (let gx = 1; gx < WORLD.size - 1; gx++) {
+        for (let gz = 1; gz < WORLD.size - 1; gz++) {
+          if (road[gx][gz] || water[gx][gz] || occupied[gx][gz]) continue
+          const h = heights[gx][gz]
+          const nearVillage = gx > 9 && gx < 29 && gz > 7 && gz < 28
+          const nearField = gx >= 23 && gx <= 31 && gz >= 11 && gz <= 16
+          const nearRiver = water[gx - 1]?.[gz] || water[gx + 1]?.[gz] || water[gx]?.[gz - 1] || water[gx]?.[gz + 1]
+          const treeChance = hash2(gx * 13.3, gz * 17.1)
+          const pine = hash2(gx * 5.2, gz * 1.7) > 0.55
+          if (!nearVillage && !nearField && (h >= 2 || nearRiver) && treeChance > (nearRiver ? 0.82 : 0.76)) {
+            addTree(gx, gz, pine)
+          } else if (h >= 3 && treeChance > 0.88) {
+            addStone(gx, gz)
+          }
+
+          if (flowerMap[gx][gz]) addFlowerPatch(gx, gz, flowerMap[gx][gz])
+        }
+      }
+
+      for (let i = 0; i < 6; i++) {
+        clouds.push({
+          x: i / 6,
+          y: 0.12 + hash2(i, i + 10) * 0.1,
+          size: 60 + hash2(i * 2, 8) * 90,
+          speed: 0.002 + hash2(i, 3) * 0.004,
+        })
+      }
+    }
+
+    function routePoint(gx, gz, y = null) {
+      return {
+        x: toWorldX(gx) + 0.5,
+        y: (y ?? getSurfaceY(gx, gz)) + 0.03,
+        z: toWorldZ(gz) + 0.5,
+      }
+    }
+
+    function createVillagers() {
+      const colors = [
+        ['#d06c5e', '#3f6ca8'],
+        ['#cf8a4a', '#5e8a52'],
+        ['#7c5ab9', '#4a96a8'],
+        ['#d6b27a', '#6b6b9d'],
+        ['#c45f93', '#4d864a'],
+        ['#5590ce', '#c97a41'],
+        ['#53a07a', '#c85d5d'],
+      ]
+
+      villagers.push(
+        {
+          name: 'Ayla',
+          route: [
+            { ...routePoint(14, 21), pause: 0.8 },
+            { ...routePoint(17, 18), pause: 0.2 },
+            { ...routePoint(18, 18), pause: 5.6, faceYaw: Math.PI * 0.25 },
+            { ...routePoint(16, 17), pause: 0.4 },
+            { ...routePoint(14, 21), pause: 1.6 },
+          ],
+          speed: 1.25,
+          shirt: colors[0][0],
+          pants: colors[0][1],
+          hat: null,
+          seed: 0.1,
+        },
+        {
+          name: 'Jun',
+          route: [
+            { ...routePoint(23, 21), pause: 1.2 },
+            { ...routePoint(20, 18), pause: 0.2 },
+            { ...routePoint(19, 18), pause: 5.6, faceYaw: -Math.PI * 0.75 },
+            { ...routePoint(21, 17), pause: 0.4 },
+            { ...routePoint(23, 21), pause: 1.4 },
+          ],
+          speed: 1.18,
+          shirt: colors[1][0],
+          pants: colors[1][1],
+          hat: null,
+          seed: 0.8,
+        },
+        {
+          name: 'Milo',
+          route: [
+            { ...routePoint(28, 13), pause: 0.6 },
+            { ...routePoint(25, 11), pause: 0.4 },
+            { ...routePoint(21, 16), pause: 0.6 },
+            { ...routePoint(18, 16), pause: 0.9 },
+            { ...routePoint(26, 13), pause: 0.7 },
+          ],
+          speed: 1.35,
+          shirt: colors[2][0],
+          pants: colors[2][1],
+          hat: palette.roofOchre,
+          seed: 1.4,
+        },
+        {
+          name: 'Nora',
+          route: [
+            { ...routePoint(13, 12), pause: 0.5 },
+            { ...routePoint(16, 16), pause: 0.3 },
+            { ...routePoint(10, 16), pause: 0.5 },
+            { ...routePoint(8, 16, 1.18), pause: 0.9 },
+            { ...routePoint(15, 17), pause: 0.3 },
+            { ...routePoint(13, 12), pause: 1.0 },
+          ],
+          speed: 1.28,
+          shirt: colors[3][0],
+          pants: colors[3][1],
+          hat: null,
+          seed: 2.1,
+        },
+        {
+          name: 'Eli',
+          route: [
+            { ...routePoint(21, 12), pause: 0.8 },
+            { ...routePoint(18, 15), pause: 0.2 },
+            { ...routePoint(16, 17), pause: 0.2 },
+            { ...routePoint(18, 19), pause: 0.2 },
+            { ...routePoint(21, 12), pause: 0.8 },
+          ],
+          speed: 1.4,
+          shirt: colors[4][0],
+          pants: colors[4][1],
+          hat: null,
+          seed: 2.8,
+        },
+        {
+          name: 'Sora',
+          route: [
+            { ...routePoint(17, 14), pause: 2.2, faceYaw: Math.PI },
+            { ...routePoint(17, 14), pause: 2.2, faceYaw: Math.PI },
+          ],
+          speed: 0,
+          shirt: colors[5][0],
+          pants: colors[5][1],
+          hat: palette.stallCloth1,
+          seed: 3.3,
+          vendor: true,
+        },
+        {
+          name: 'Tali',
+          route: [
+            { ...routePoint(19, 14), pause: 2.1, faceYaw: Math.PI },
+            { ...routePoint(19, 14), pause: 2.1, faceYaw: Math.PI },
+          ],
+          speed: 0,
+          shirt: colors[6][0],
+          pants: colors[6][1],
+          hat: palette.stallCloth3,
+          seed: 4.5,
+          vendor: true,
+        },
+      )
+
+      villagers.forEach((villager, i) => {
+        villager.segment = i % Math.max(1, villager.route.length - 1)
+        villager.position = { ...villager.route[villager.segment] }
+        villager.wait = villager.route[villager.segment].pause || 0
+        const nextPoint = villager.route[(villager.segment + 1) % villager.route.length]
+        villager.facing = Math.atan2(nextPoint.x - villager.position.x, nextPoint.z - villager.position.z)
+      })
+    }
+
+    const camera = {
+      yaw: Math.PI / 4,
+      pitch: 0.64,
+      distance: 34,
+      zoom: 28,
+      target: { x: 0.6, y: 1.4, z: 0.5 },
+    }
+
+    const keys = new Set()
+    const pointer = {
+      down: false,
+      mode: 'orbit',
+      x: 0,
+      y: 0,
+    }
+
+    let paused = false
+    let lastTime = performance.now()
+
+    function getCameraBasis() {
+      const dir = {
+        x: Math.cos(camera.pitch) * Math.sin(camera.yaw),
+        y: Math.sin(camera.pitch),
+        z: Math.cos(camera.pitch) * Math.cos(camera.yaw),
+      }
+      const position = {
+        x: camera.target.x + dir.x * camera.distance,
+        y: camera.target.y + dir.y * camera.distance,
+        z: camera.target.z + dir.z * camera.distance,
+      }
+      const forward = normalize(sub(camera.target, position))
+      let right = normalize(cross(vec3(0, 1, 0), forward))
+      if (length(right) < 0.001) right = vec3(1, 0, 0)
+      const up = normalize(cross(forward, right))
+      return { position, forward, right, up }
+    }
+
+    function projectPoint(point, basis) {
+      const rel = sub(point, basis.position)
+      return {
+        x: dot(rel, basis.right),
+        y: dot(rel, basis.up),
+        z: dot(rel, basis.forward),
+      }
+    }
+
+    function updateCamera(dt) {
+      const moveSpeed = 9 * dt * (camera.zoom / 28)
+      const rotateSpeed = 1.45 * dt
+      const zoomSpeed = 22 * dt
+      const basis = getCameraBasis()
+      const flatRight = normalize(vec3(basis.right.x, 0, basis.right.z))
+      const flatForward = normalize(vec3(basis.forward.x, 0, basis.forward.z))
+
+      if (keys.has('a') || keys.has('arrowleft')) camera.target = add(camera.target, scale(flatRight, -moveSpeed))
+      if (keys.has('d') || keys.has('arrowright')) camera.target = add(camera.target, scale(flatRight, moveSpeed))
+      if (keys.has('w') || keys.has('arrowup')) camera.target = add(camera.target, scale(flatForward, moveSpeed))
+      if (keys.has('s') || keys.has('arrowdown')) camera.target = add(camera.target, scale(flatForward, -moveSpeed))
+      if (keys.has('q')) camera.yaw -= rotateSpeed
+      if (keys.has('e')) camera.yaw += rotateSpeed
+      if (keys.has('r')) camera.pitch = clamp(camera.pitch + rotateSpeed * 0.8, 0.42, 1.0)
+      if (keys.has('f')) camera.pitch = clamp(camera.pitch - rotateSpeed * 0.8, 0.42, 1.0)
+      if (keys.has('=') || keys.has('+')) camera.zoom = clamp(camera.zoom + zoomSpeed, 16, 52)
+      if (keys.has('-') || keys.has('_')) camera.zoom = clamp(camera.zoom - zoomSpeed, 16, 52)
+      if (keys.has('0')) {
+        camera.yaw = lerp(camera.yaw, Math.PI / 4, Math.min(1, dt * 4))
+        camera.pitch = lerp(camera.pitch, 0.64, Math.min(1, dt * 4))
+        camera.zoom = lerp(camera.zoom, 28, Math.min(1, dt * 4))
+        camera.target.x = lerp(camera.target.x, 0.6, Math.min(1, dt * 4))
+        camera.target.y = lerp(camera.target.y, 1.4, Math.min(1, dt * 4))
+        camera.target.z = lerp(camera.target.z, 0.5, Math.min(1, dt * 4))
+      }
+      camera.target.y = clamp(camera.target.y, 0.4, 3)
+    }
+
+    function updateVillagers(dt, elapsed) {
+      if (paused) return
+      villagers.forEach((v) => {
+        if (v.speed <= 0) {
+          v.facing = v.route[v.segment].faceYaw ?? v.facing
+          return
+        }
+        if (v.wait > 0) {
+          v.wait -= dt
+          if (v.route[v.segment].faceYaw != null) {
+            v.facing = v.route[v.segment].faceYaw
+          }
+          if (v.wait > 0) return
+        }
+
+        const nextIndex = (v.segment + 1) % v.route.length
+        const target = v.route[nextIndex]
+        const delta = sub(target, v.position)
+        const dist = Math.hypot(delta.x, delta.z)
+        const travel = v.speed * dt
+
+        if (dist <= travel + 0.001) {
+          v.position = { ...target }
+          v.segment = nextIndex
+          v.wait = target.pause || 0
+          if (target.faceYaw != null) v.facing = target.faceYaw
+        } else {
+          const nx = delta.x / dist
+          const nz = delta.z / dist
+          v.position.x += nx * travel
+          v.position.z += nz * travel
+          v.position.y = lerp(v.position.y, target.y, 0.08)
+          v.facing = Math.atan2(nx, nz)
+        }
+      })
+    }
+
+    function addRegularPolygonFace(target, center, radiusX, radiusZ, y, sides, color, alpha = 0.25) {
+      const verts = []
+      for (let i = 0; i < sides; i++) {
+        const a = (i / sides) * TAU
+        verts.push(vec3(center.x + Math.cos(a) * radiusX, y, center.z + Math.sin(a) * radiusZ))
+      }
+      pushFace(target, verts, color, { alpha, strokeAlpha: 0 })
+    }
+
+    function addVillagerFaces(target, villager, elapsed) {
+      const walkMix = villager.speed > 0 && villager.wait <= 0 ? 1 : 0.18
+      const cycle = Math.sin(elapsed * 7 + villager.seed * 4) * walkMix
+      const bob = Math.abs(cycle) * 0.05 * walkMix
+      const yaw = villager.facing
+      const p = villager.position
+      const shadowY = p.y + 0.01
+      addRegularPolygonFace(target, p, 0.22, 0.16, shadowY, 8, '#000000', 0.12)
+
+      const localToWorld = (lx, ly, lz) => {
+        const rotated = rotateY(vec3(lx, ly, lz), yaw)
+        return { x: p.x + rotated.x, y: p.y + rotated.y, z: p.z + rotated.z }
+      }
+      const addPart = (lx, ly, lz, w, h, d, color, extraYaw = 0) => {
+        const center = localToWorld(lx, ly, lz)
+        pushBox(target, center.x - w / 2, center.y, center.z - d / 2, w, h, d, color, {
+          yaw: yaw + extraYaw,
+          pivot: { x: center.x, y: center.y, z: center.z },
+        })
+      }
+
+      addPart(-0.09, 0.04, cycle * 0.08, 0.12, 0.48, 0.14, villager.pants)
+      addPart(0.09, 0.04, -cycle * 0.08, 0.12, 0.48, 0.14, villager.pants)
+      addPart(0, 0.42 + bob, 0, 0.34, 0.46, 0.22, villager.shirt)
+      addPart(-0.24, 0.46 + bob, -cycle * 0.06, 0.1, 0.4, 0.1, villager.shirt)
+      addPart(0.24, 0.46 + bob, cycle * 0.06, 0.1, 0.4, 0.1, villager.shirt)
+      addPart(0, 0.9 + bob, 0, 0.28, 0.28, 0.28, '#f0d1b0')
+      if (villager.hat) {
+        addPart(0, 1.12 + bob, 0, 0.34, 0.08, 0.34, villager.hat)
+      }
+      if (villager.vendor) {
+        addPart(0, 0.66 + bob, 0.12, 0.38, 0.1, 0.08, palette.woodDark)
+      }
+    }
+
+    function buildDynamicFaces(elapsed) {
+      const dynamicFaces = []
+      for (const tile of waterTiles) {
+        const x = toWorldX(tile.gx)
+        const z = toWorldZ(tile.gz)
+        const wave = Math.sin(elapsed * 2.4 + tile.phase + tile.gx * 0.5 + tile.gz * 0.22) * 0.03
+        const y = WORLD.waterLevel + wave
+        pushQuad(
+          dynamicFaces,
+          vec3(x, y, z + 1),
+          vec3(x + 1, y, z + 1),
+          vec3(x + 1, y, z),
+          vec3(x, y, z),
+          (tile.gx + tile.gz) % 2 === 0 ? palette.water : palette.waterDark,
+          { alpha: 0.92, strokeAlpha: 0.03 },
+        )
+      }
+
+      const fountainY = getSurfaceY(18, 17) + 1.28
+      const fountainPulse = Math.sin(elapsed * 4) * 0.06
+      pushBox(dynamicFaces, toWorldX(18) + 0.92, fountainY, toWorldZ(17) + 0.92, 0.16, 0.45 + fountainPulse, 0.16, palette.water, { alpha: 0.78, emissive: 0.15 })
+      pushBox(dynamicFaces, toWorldX(18) + 0.78, fountainY + 0.28, toWorldZ(17) + 0.78, 0.44, 0.12, 0.44, palette.water, { alpha: 0.42 })
+
+      smokeEmitters.forEach((emitter, index) => {
+        for (let i = 0; i < 3; i++) {
+          const t = (elapsed * 0.18 + i * 0.33 + index * 0.11 + emitter.phase / TAU) % 1
+          const rise = t * 1.9
+          const swayX = Math.sin((t + index) * TAU * 1.3) * 0.12
+          const swayZ = Math.cos((t + index * 0.7) * TAU * 1.1) * 0.12
+          const size = 0.18 + t * 0.18
+          pushBox(dynamicFaces, emitter.x - size / 2 + swayX, emitter.y + rise, emitter.z - size / 2 + swayZ, size, size * 0.75, size, palette.smoke, {
+            alpha: 0.35 * (1 - t),
+            strokeAlpha: 0,
+          })
+        }
+      })
+
+      villagers.forEach((villager) => addVillagerFaces(dynamicFaces, villager, elapsed))
+
+      lanterns.forEach((lantern) => {
+        const glowY = lantern.y + 0.02
+        addRegularPolygonFace(dynamicFaces, { x: lantern.x, y: glowY, z: lantern.z }, 0.18, 0.18, glowY, 10, palette.lantern, 0.18)
+      })
+
+      return dynamicFaces
+    }
+
+    function render(elapsed) {
+      const width = viewportWidth || canvas.clientWidth || canvas.width
+      const height = viewportHeight || canvas.clientHeight || canvas.height
+      const sky = ctx.createLinearGradient(0, 0, 0, height)
+      sky.addColorStop(0, '#c8ebff')
+      sky.addColorStop(0.55, '#def4ff')
+      sky.addColorStop(1, '#f4fbff')
+      ctx.fillStyle = sky
+      ctx.fillRect(0, 0, width, height)
+
+      ctx.save()
+      clouds.forEach((cloud, i) => {
+        const x = ((cloud.x + elapsed * cloud.speed) % 1) * (width + cloud.size * 2) - cloud.size
+        const y = cloud.y * height
+        const size = cloud.size
+        ctx.fillStyle = 'rgba(255,255,255,0.62)'
+        ctx.beginPath()
+        ctx.ellipse(x, y, size * 0.55, size * 0.28, 0, 0, TAU)
+        ctx.ellipse(x - size * 0.28, y + 3, size * 0.35, size * 0.22, 0, 0, TAU)
+        ctx.ellipse(x + size * 0.24, y + 1, size * 0.38, size * 0.24, 0, 0, TAU)
+        ctx.fill()
+      })
+      ctx.restore()
+
+      const basis = getCameraBasis()
+      const lightDir = normalize(vec3(-0.55, 1, 0.35))
+      const allFaces = staticFaces.concat(buildDynamicFaces(elapsed))
+      const projected = []
+
+      for (const face of allFaces) {
+        const normal = face.normal || computeNormal(face.verts)
+        const facing = dot(normal, basis.forward)
+        if (facing >= -0.01) continue
+
+        const pts = []
+        let depth = 0
+        let screenMinX = Infinity
+        let screenMaxX = -Infinity
+        let screenMinY = Infinity
+        let screenMaxY = -Infinity
+        for (const v of face.verts) {
+          const p = projectPoint(v, basis)
+          depth += p.z
+          const sx = width * 0.5 + p.x * camera.zoom
+          const sy = height * 0.58 - p.y * camera.zoom
+          pts.push({ x: sx, y: sy, z: p.z })
+          if (sx < screenMinX) screenMinX = sx
+          if (sx > screenMaxX) screenMaxX = sx
+          if (sy < screenMinY) screenMinY = sy
+          if (sy > screenMaxY) screenMaxY = sy
+        }
+        depth /= face.verts.length
+        if (screenMaxX < -80 || screenMinX > width + 80 || screenMaxY < -80 || screenMinY > height + 80) continue
+        if (depth < -5) continue
+
+        const light = 0.58 + Math.max(0, dot(normal, lightDir)) * 0.55 + (face.emissive || 0)
+        const fog = clamp((depth - 16) / 55, 0, 0.35)
+        projected.push({
+          pts,
+          depth,
+          fill: shadeHex(face.color, light, fog, face.alpha),
+          stroke: face.strokeAlpha > 0 ? `rgba(20, 28, 35, ${face.strokeAlpha * (1 - fog)})` : null,
+        })
+      }
+
+      projected.sort((a, b) => b.depth - a.depth)
+
+      for (const poly of projected) {
+        ctx.beginPath()
+        ctx.moveTo(poly.pts[0].x, poly.pts[0].y)
+        for (let i = 1; i < poly.pts.length; i++) ctx.lineTo(poly.pts[i].x, poly.pts[i].y)
+        ctx.closePath()
+        ctx.fillStyle = poly.fill
+        ctx.fill()
+        if (poly.stroke) {
+          ctx.strokeStyle = poly.stroke
+          ctx.lineWidth = 1
+          ctx.stroke()
+        }
+      }
+    }
+
+    function animate(now) {
+      const dt = Math.min(0.05, (now - lastTime) / 1000)
+      lastTime = now
+      updateCamera(dt)
+      updateVillagers(dt, now / 1000)
+      render(now / 1000)
+      requestAnimationFrame(animate)
+    }
+
+    function resize() {
+      const dpr = Math.min(window.devicePixelRatio || 1, 2)
+      const rect = canvas.getBoundingClientRect()
+      viewportWidth = rect.width
+      viewportHeight = rect.height
+      canvas.width = Math.round(rect.width * dpr)
+      canvas.height = Math.round(rect.height * dpr)
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
+    }
+
+    canvas.addEventListener('contextmenu', (e) => e.preventDefault())
+    canvas.addEventListener('pointerdown', (e) => {
+      pointer.down = true
+      pointer.x = e.clientX
+      pointer.y = e.clientY
+      pointer.mode = (e.button === 2 || e.shiftKey || e.button === 1) ? 'pan' : 'orbit'
+      canvas.classList.add('dragging')
+      canvas.setPointerCapture(e.pointerId)
+    })
+    canvas.addEventListener('pointermove', (e) => {
+      if (!pointer.down) return
+      const dx = e.clientX - pointer.x
+      const dy = e.clientY - pointer.y
+      pointer.x = e.clientX
+      pointer.y = e.clientY
+      if (pointer.mode === 'orbit') {
+        camera.yaw -= dx * 0.008
+        camera.pitch = clamp(camera.pitch - dy * 0.006, 0.42, 1.0)
+      } else {
+        const basis = getCameraBasis()
+        const flatRight = normalize(vec3(basis.right.x, 0, basis.right.z))
+        const flatForward = normalize(vec3(basis.forward.x, 0, basis.forward.z))
+        const panScale = 0.03 * (camera.zoom / 28)
+        camera.target = add(camera.target, add(scale(flatRight, -dx * panScale), scale(flatForward, dy * panScale)))
+      }
+    })
+    const releasePointer = () => {
+      pointer.down = false
+      canvas.classList.remove('dragging')
+    }
+    canvas.addEventListener('pointerup', releasePointer)
+    canvas.addEventListener('pointercancel', releasePointer)
+    canvas.addEventListener('wheel', (e) => {
+      e.preventDefault()
+      camera.zoom = clamp(camera.zoom - Math.sign(e.deltaY) * 2.2, 16, 52)
+    }, { passive: false })
+
+    window.addEventListener('keydown', (e) => {
+      const key = e.key.toLowerCase()
+      if ([' ', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright'].includes(key)) e.preventDefault()
+      if (key === ' ') {
+        paused = !paused
+        return
+      }
+      keys.add(key)
+    })
+    window.addEventListener('keyup', (e) => {
+      keys.delete(e.key.toLowerCase())
+    })
+    window.addEventListener('resize', resize)
+
+    buildWorld()
+    createVillagers()
+    resize()
+    requestAnimationFrame((time) => {
+      lastTime = time
+      requestAnimationFrame(animate)
+    })
+  </script>
+</body>
+</html>
